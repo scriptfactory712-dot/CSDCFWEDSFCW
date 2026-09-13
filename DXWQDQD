@@ -1,4 +1,6 @@
 -- [[ Lua Hub — DOORS ULTIMATE SCRIPT v3.51 ]]
+-- v3.64 MOBILE DRAWERS: touch-safe fireproximityprompt + native InputHold fallback;
+-- ПК-путь не изменён, повторные мобильные удержания дедуплицируются по prompt.
 -- v3.63 SEEK RUN: временный WalkSpeed boost при реальном появлении Seek, без teleport.
 -- v3.62 HIDING/SINGLETON: безусловный запрет авто-входа и остановка предыдущей копии.
 -- v3.61 AUTO/PERFORMANCE: авто-двери, предметы и монеты; полный запрет auto-hide;
@@ -64,7 +66,7 @@ local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Camera = workspace.CurrentCamera
 local Lighting = game:GetService("Lighting")
-local HUB_VERSION = "3.63"
+local HUB_VERSION = "3.64"
 local originalFov = Camera and Camera.FieldOfView or 70
 
 -- Единый профиль производительности. На телефоне Roblox одновременно стримит
@@ -1573,24 +1575,24 @@ task.spawn(function()
                     if esp.Billboard then esp.Billboard:Destroy() end
                     if esp.Highlight then esp.Highlight:Destroy() end
                     table.remove(ActiveESPs, i)
-                else
-                    local screenPos, onScreen = Camera:WorldToViewportPoint(esp.Part.Position)
-                    if onScreen and screenPos.Z > 0 then
-                        if esp.Billboard then esp.Billboard.Enabled = true end
-                        local c = espSettings.colors[esp.Type] or Color3.new(1, 1, 1)
-                        if esp.Label then esp.Label.TextColor3 = c end
-                        if esp.Highlight then esp.Highlight.FillColor = c end
-                        if esp.Label then
-                            if espSettings.distance and LPlayer.Character and LPlayer.Character.PrimaryPart then
-                                local dist = math.floor((esp.Part.Position - LPlayer.Character.PrimaryPart.Position).Magnitude)
-                                esp.Label.Text = esp.Text .. " [" .. dist .. "m]"
-                            else
-                                esp.Label.Text = esp.Text
-                            end
+                    continue
+                end
+                local screenPos, onScreen = Camera:WorldToViewportPoint(esp.Part.Position)
+                if onScreen and screenPos.Z > 0 then
+                    if esp.Billboard then esp.Billboard.Enabled = true end
+                    local c = espSettings.colors[esp.Type] or Color3.new(1, 1, 1)
+                    if esp.Label then esp.Label.TextColor3 = c end
+                    if esp.Highlight then esp.Highlight.FillColor = c end
+                    if esp.Label then
+                        if espSettings.distance and LPlayer.Character and LPlayer.Character.PrimaryPart then
+                            local dist = math.floor((esp.Part.Position - LPlayer.Character.PrimaryPart.Position).Magnitude)
+                            esp.Label.Text = esp.Text .. " [" .. dist .. "m]"
+                        else
+                            esp.Label.Text = esp.Text
                         end
-                    else
-                        if esp.Billboard then esp.Billboard.Enabled = false end
                     end
+                else
+                    if esp.Billboard then esp.Billboard.Enabled = false end
                 end
             end
             GlobalPruneFar()
@@ -1602,6 +1604,7 @@ end)
 -- A single owner for navigation, prompt safety and reversible instant-hold changes.
 local DoorAssist = {
     fired = setmetatable({}, {__mode = "k"}),
+    mobileDrawerPending = setmetatable({}, {__mode = "k"}),
     instantDurations = setmetatable({}, {__mode = "k"}),
     -- Промпт, который игра прямо сейчас показывает игроку (ведётся по
     -- PromptShown/PromptHidden). Нужен, чтобы клавиша E уходила именно в нашу цель,
@@ -1845,9 +1848,35 @@ local function FirePrompt(prompt, mode, radius)
     if mode == "autoPickup" then cooldown = IS_MOBILE and 0.75 or 0.50 end
     if nowF - (DoorAssist.fired[prompt] or -10) < cooldown then return false end
     DoorAssist.fired[prompt] = nowF
+    local touchDrawer = mode == "autoDrawer" and UserInputService.TouchEnabled
     if type(fireproximityprompt) == "function" then
-        local ok = pcall(fireproximityprompt, prompt, 0)
-        if ok then return true end
+        -- Некоторые мобильные executors молча игнорируют второй аргумент, но pcall
+        -- всё равно возвращает true. На touch вызываем совместимую одноаргументную
+        -- форму и ниже оставляем нативную страховку; ПК использует прежний быстрый путь.
+        local ok
+        if touchDrawer then
+            ok = pcall(fireproximityprompt, prompt)
+        else
+            ok = pcall(fireproximityprompt, prompt, 0)
+        end
+        if ok and not touchDrawer then return true end
+    end
+    if touchDrawer then
+        -- Один fallback на prompt: сканер и PromptShown могут найти один ящик вместе.
+        -- Небольшая задержка даёт fireproximityprompt время отключить уже открытый
+        -- prompt; если он остался активен, имитируем настоящее удержание на телефоне.
+        if not DoorAssist.mobileDrawerPending[prompt] then
+            DoorAssist.mobileDrawerPending[prompt] = true
+            local hold = tonumber(prompt.HoldDuration) or 0.12
+            task.delay(0.10, function()
+                if HubActive and prompt and prompt.Parent and prompt.Enabled
+                    and not DoorAssist.protected(prompt, nil) then
+                    DoorAssist.nativeHoldPress(prompt, hold)
+                end
+                DoorAssist.mobileDrawerPending[prompt] = nil
+            end)
+        end
+        return true
     end
     -- Executor без fireproximityprompt: нативный fallback не блокирует сканер.
     local hold = tonumber(prompt.HoldDuration) or 0.12
@@ -2676,22 +2705,19 @@ local function StartHub()
             task.spawn(function()
                 while HubActive do
                     task.wait(IS_MOBILE and 0.45 or 0.30)
+                    if not autoCoinEnabled then continue end
                     local root = LPlayer.Character and LPlayer.Character:FindFirstChild("HumanoidRootPart")
-                    if autoCoinEnabled and root then
-                        local budget = IS_MOBILE and 5 or 9
-                        for pile in pairs(goldPiles) do
-                            if budget <= 0 then break end
-                            if not pile.Parent then
-                                goldPiles[pile] = nil
-                            else
-                                local prompt = pile:FindFirstChild("LootPrompt")
-                                    or pile:FindFirstChildWhichIsA("ProximityPrompt", true)
-                                if prompt and prompt.Parent and not prompt:GetAttribute("Interactions") then
-                                    local pos = promptWorldPosition(prompt)
-                                    if pos and (pos - root.Position).Magnitude <= autoCoinRadius then
-                                        if FirePrompt(prompt, "autoPickup", autoCoinRadius) then budget = budget - 1 end
-                                    end
-                                end
+                    if not root then continue end
+                    local budget = IS_MOBILE and 5 or 9
+                    for pile in pairs(goldPiles) do
+                        if budget <= 0 then break end
+                        if not pile.Parent then goldPiles[pile] = nil continue end
+                        local prompt = pile:FindFirstChild("LootPrompt")
+                            or pile:FindFirstChildWhichIsA("ProximityPrompt", true)
+                        if prompt and prompt.Parent and not prompt:GetAttribute("Interactions") then
+                            local pos = promptWorldPosition(prompt)
+                            if pos and (pos - root.Position).Magnitude <= autoCoinRadius then
+                                if FirePrompt(prompt, "autoPickup", autoCoinRadius) then budget = budget - 1 end
                             end
                         end
                     end
@@ -2961,7 +2987,8 @@ local function StartHub()
     task.spawn(function()
         while HubActive do
             task.wait(fpsBoost and (IS_MOBILE and 1.35 or 1) or PERF.autoOpenTick)
-            if openAllOn then pcall(function()
+            if not openAllOn then continue end
+            pcall(function()
                 local rooms = workspace:FindFirstChild("CurrentRooms")
                 if not rooms then return end
                 local list = rooms:GetChildren()
@@ -3000,7 +3027,7 @@ local function StartHub()
                         end
                     end
                 end
-            end) end
+            end)
         end
     end)
 
@@ -3146,7 +3173,9 @@ local function StartHub()
     task.spawn(function()
         while HubActive do
             task.wait(0.5)
-            if chestForce and getFloor() == 1 then pcall(function()
+            if not chestForce then continue end
+            if getFloor() ~= 1 then continue end
+            pcall(function()
                 local char = LPlayer.Character
                 local root = char and char:FindFirstChild("HumanoidRootPart")
                 local hum = char and char:FindFirstChildOfClass("Humanoid")
@@ -3214,7 +3243,7 @@ local function StartHub()
                 for k in pairs(chestState) do
                     if not k.Parent then chestState[k] = nil end
                 end
-            end) end
+            end)
         end
     end)
 
@@ -3252,7 +3281,8 @@ local function StartHub()
     task.spawn(function()
         while HubActive do
             task.wait(0.3)
-            if autoHideEnabled or (bdRuntime.autoHide and getFloor() == 0) then pcall(function()
+            if not autoHideEnabled and not (bdRuntime.autoHide and getFloor() == 0) then continue end
+            pcall(function()
                 local root = LPlayer.Character and LPlayer.Character:FindFirstChild("HumanoidRootPart")
                 if not root then return end
                 local dangerFound = false
@@ -3271,7 +3301,7 @@ local function StartHub()
                         end
                     end
                 end)
-            end) end
+            end)
         end
     end)
 
@@ -3308,7 +3338,8 @@ local function StartHub()
     task.spawn(function()
         while HubActive do
             task.wait(0.5)
-            if autoObjectives or autoFuseInsert then pcall(function()
+            if not autoObjectives and not autoFuseInsert then continue end
+            pcall(function()
                 local root = LPlayer.Character and LPlayer.Character:FindFirstChild("HumanoidRootPart")
                 if not root then return end
                 local floor = getFloor()
@@ -3347,14 +3378,16 @@ local function StartHub()
                         end
                     end
                 end
-            end) end
+            end)
         end
     end)
 
     task.spawn(function()
         while HubActive do
             task.wait(1)
-            if autoLightMines and getFloor() == 2 then pcall(function()
+            if not autoLightMines then continue end
+            if getFloor() ~= 2 then continue end
+            pcall(function()
                 local char = LPlayer.Character
                 local hum = char and char:FindFirstChildOfClass("Humanoid")
                 if not char or not hum then return end
@@ -3377,7 +3410,7 @@ local function StartHub()
                         end
                     end
                 end
-            end) end
+            end)
         end
     end)
 
@@ -3544,9 +3577,10 @@ local function StartHub()
             if not show then
                 if WarnPanel.Text ~= "" then WarnPanel.Text = "" end
                 WarnPanel.Visible = false
-            else
-                WarnPanel.Visible = true
-                pcall(function()
+                continue
+            end
+            WarnPanel.Visible = true
+            pcall(function()
                 local lines = {}
                 if inMines then
                     local obj = nearestObjective()
@@ -3632,8 +3666,7 @@ local function StartHub()
                 -- FIX лагов: перезапись Text каждый тик дёргает рендер, пишем только новое.
                 local newText = table.concat(lines, "\n")
                 if WarnPanel.Text ~= newText then WarnPanel.Text = newText end
-                end)
-            end
+            end)
         end
     end)
 
@@ -5323,7 +5356,8 @@ local function StartHub()
     task.spawn(function()
         while HubActive do
             task.wait(fpsBoost and 4 or 2.0)
-            if odAnyOn then pcall(function()
+            if not odAnyOn then continue end
+            pcall(function()
                 for _, v in ipairs(workspace:GetChildren()) do
                     if v:IsA("Model") then odApply(v) end
                 end
@@ -5343,7 +5377,7 @@ local function StartHub()
                 end
                 -- Последовательную odDoor очищает только её state machine.
                 -- Это исключает мерцание и повторное создание одной и той же дальней двери.
-            end) end
+            end)
         end
     end)
     task.spawn(function()
@@ -6097,7 +6131,8 @@ local function StartHub()
     task.spawn(function()
         while HubActive do
             task.wait(3.0)
-            if globalMines then pcall(function()
+            if not globalMines then continue end
+            pcall(function()
                 local gameData = ReplicatedStorage:FindFirstChild("GameData")
                 local latest = gameData and gameData:FindFirstChild("LatestRoom")
                 local cur = latest and latest.Value or 0
@@ -6144,7 +6179,7 @@ local function StartHub()
                 PruneFar("chest", 800)
                 PruneFar("hiding", 800)
                 PruneFar("shakelightMachine", 800)
-            end) end
+            end)
         end
     end)
 
@@ -6152,7 +6187,8 @@ local function StartHub()
     task.spawn(function()
         while HubActive do
             task.wait(4)
-            if tracker.books then pcall(function()
+            if not tracker.books then continue end
+            pcall(function()
                 local gameData = ReplicatedStorage:FindFirstChild("GameData")
                 local latest = gameData and gameData:FindFirstChild("LatestRoom")
                 local cur = latest and latest.Value or 0
@@ -6182,14 +6218,15 @@ local function StartHub()
                     Rayfield:Notify({Title = "📚 Books", Content = "Синие книги кода подсвечены: " .. newCount, Duration = 3})
                 end
                 PruneFar("books", 200)
-            end) end
+            end)
         end
     end)
 
     task.spawn(function()
         while HubActive do
             task.wait(2)
-            if tracker.snare then pcall(function()
+            if not tracker.snare then continue end
+            pcall(function()
                 local gameData = ReplicatedStorage:FindFirstChild("GameData")
                 local latestRoom2 = gameData and gameData:FindFirstChild("LatestRoom")
                 local cur2 = latestRoom2 and latestRoom2.Value or 0
@@ -6215,7 +6252,7 @@ local function StartHub()
                     end
                 end
                 PruneFar("snare", 250)
-            end) end
+            end)
         end
     end)
 
@@ -6564,7 +6601,8 @@ local function StartHub()
     task.spawn(function()
         while HubActive do
             task.wait(1)
-            if FloorLabel then pcall(function()
+            if not FloorLabel then continue end
+            pcall(function()
                 local floor = getFloor()
                 local cur = getCurrentRoom()
                 if floor == 0 then
@@ -6598,7 +6636,7 @@ local function StartHub()
                         Content = "Outdoors — Progress " .. cur
                     })
                 end
-            end) end
+            end)
         end
     end)
 
